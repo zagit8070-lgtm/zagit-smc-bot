@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import re
 from datetime import datetime, time
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -9,6 +10,7 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
+import urllib.request
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
@@ -32,69 +34,95 @@ def save_trades(trades):
 CHECKLIST = """✅ *Чеклист перед входом в сделку*
 
 1️⃣ Определил направление по азиатской сессии?
-   _Азия бычья → ищу покупки / медвежья → продажи_
-
 2️⃣ Есть OB или FVG на старшем ТФ?
-   _🟢 OB или 🟣 FVG чётко обозначены?_
-
 3️⃣ Есть confluence? (OB + FVG в одной зоне)
-   _Приоритетный сетап — оба совпадают_
-
 4️⃣ Подтверждение на 1М получено?
-   _Buy: красная → зелёная свеча_
-   _Sell: зелёная → красная свеча_
-
 5️⃣ Проверил новости?
-   _Нет новостей 3🐂 в ближайшие 30 мин?_
-
-6️⃣ Время торговли правильное?
-   _Лондон 10:00–12:00 МСК или NY 15:00–17:00 МСК_
-
+6️⃣ Время торговли правильное? (Лондон 10–12 / NY 15–17 МСК)
 7️⃣ R:R не менее 1:2?
-   _Цель минимум 1:3_
+8️⃣ Размер позиции рассчитан?
 
-8️⃣ Размер позиции рассчитан по риск-менеджменту?
+Если все 8 ✅ — входи. Если нет — пропусти."""
 
-━━━━━━━━━━━━━━━━━━━━
-Если все 8 пунктов ✅ — входи. Если нет — пропусти сделку."""
+# ─── ПАРСИНГ FOREX FACTORY ────────────────────────────────────────────────────
+def fetch_news_today():
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
 
+        today = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+        results = []
+
+        for item in data:
+            # Только USD новости с импактом High
+            if item.get("impact") != "High":
+                continue
+            if item.get("country") != "USD":
+                continue
+
+            # Парсим время
+            raw_date = item.get("date", "")
+            try:
+                # Формат: "2026-06-08T12:30:00-04:00"
+                dt_utc = datetime.fromisoformat(raw_date)
+                dt_msk = dt_utc.astimezone(MOSCOW_TZ)
+                if dt_msk.strftime("%Y-%m-%d") != today:
+                    continue
+                time_str = dt_msk.strftime("%H:%M")
+            except Exception:
+                continue
+
+            results.append({
+                "title": item.get("title", ""),
+                "time": time_str
+            })
+
+        return sorted(results, key=lambda x: x["time"])
+
+    except Exception as e:
+        logger.error(f"Ошибка парсинга новостей: {e}")
+        return []
+
+def format_news_message(news_list):
+    today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+
+    if not news_list:
+        return f"📰 *Новости USD 3🐂 на {today}*\n\n✅ Важных новостей нет — можно торговать спокойно!"
+
+    text = f"📰 *Важные новости USD на {today}*\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for n in news_list:
+        text += f"🔴 *{n['time']} МСК* — {n['title']}\n"
+        text += f"   ⚠️ Не входить с {n['time'][:-2]}{int(n['time'][-2:])-15:02d} до {n['time'][:-2]}{int(n['time'][-2:])+15:02d}\n\n"
+
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += "⚠️ За 15–30 мин до и после — *не входить в сделки!*"
+    return text
+
+# ─── КОМАНДЫ ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [KeyboardButton("📝 Новая сделка"), KeyboardButton("📊 Статистика")],
         [KeyboardButton("✅ Чеклист"), KeyboardButton("📰 Новости")],
         [KeyboardButton("❓ Помощь")]
     ]
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
         "👋 Привет, Загит!\n\nЯ твой трейдинг-ассистент по SMC.\n"
         "Помогу логировать сделки, напоминать о сессиях и новостях.\n\n"
         "Выбери действие:",
-        reply_markup=markup
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
 async def checklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(CHECKLIST, parse_mode="Markdown")
 
 async def news_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = """📰 *Ключевые новости для XAUUSD и EURUSD*
-
-🔴 *NFP* — Первая пятница месяца, 15:30 МСК
-   _Не входить за 30 мин до и 30 мин после_
-
-🔴 *CPI* — ~10–12 числа, 15:30 МСК
-   _Сильно двигает золото и доллар_
-
-🔴 *Решение ФРС* — каждые 6 недель, 21:00 МСК
-   _+пресс-конференция Пауэлла через 30 мин_
-
-🟡 *Другие USD новости 3🐂*:
-   • ADP Employment (каждую среду)
-   • Retail Sales (~15-го числа)
-   • GDP (~конец месяца)
-
-━━━━━━━━━━━━━━━━━━━━
-⚠️ Правило: за 15–30 мин до новости 3🐂 и 15–30 мин после — *не входить в сделку*."""
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text("⏳ Загружаю новости...")
+    news = fetch_news_today()
+    await update.message.reply_text(format_news_message(news), parse_mode="Markdown")
 
 async def trade_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keyboard = [["XAUUSD", "EURUSD"]]
@@ -108,19 +136,15 @@ async def trade_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def trade_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["pair"] = update.message.text
     keyboard = [["BUY", "SELL"]]
-    await update.message.reply_text(
-        "Направление?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    )
+    await update.message.reply_text("Направление?",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True))
     return DIRECTION
 
 async def trade_direction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["direction"] = update.message.text
     keyboard = [["OB", "FVG", "OB + FVG"]]
-    await update.message.reply_text(
-        "Сетап?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    )
+    await update.message.reply_text("Сетап?",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True))
     return SETUP
 
 async def trade_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -140,7 +164,7 @@ async def trade_sl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def trade_tp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["tp"] = update.message.text
-    await update.message.reply_text("Заметка (сессия, причина, ошибки) или напиши /skip:")
+    await update.message.reply_text("Заметка или /skip:")
     return NOTE
 
 async def trade_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -178,59 +202,49 @@ async def save_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 📅 {trade['date']}
 📝 {trade['note'] or '—'}
 
-_ID сделки: {trade['id']}_
-_Используй /result {trade['id']} +150 чтобы записать результат_"""
+_ID: {trade['id']}_
+_/result {trade['id']} +150_"""
 
     keyboard = [
         ["📝 Новая сделка", "📊 Статистика"],
         ["✅ Чеклист", "📰 Новости"],
         ["❓ Помощь"]
     ]
-    await update.message.reply_text(
-        summary,
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
+    await update.message.reply_text(summary, parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keyboard = [["📝 Новая сделка", "📊 Статистика"], ["✅ Чеклист", "📰 Новости"]]
-    await update.message.reply_text(
-        "Отменено.",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
+    await update.message.reply_text("Отменено.",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     return ConversationHandler.END
 
 async def result_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if len(args) < 2:
-        await update.message.reply_text("Использование: /result <ID> <результат$>\nПример: /result 1234567890 +150")
+        await update.message.reply_text("Использование: /result <ID> <сумма>\nПример: /result 1234567890 +150")
         return
-    trade_id = int(args[0])
-    pnl_str = args[1]
     try:
-        pnl = float(pnl_str.replace("+", ""))
+        trade_id = int(args[0])
+        pnl = float(args[1].replace("+", ""))
     except ValueError:
-        await update.message.reply_text("Неверный формат. Пример: /result 1234567890 +150")
+        await update.message.reply_text("Неверный формат.")
         return
     trades = load_trades()
-    found = False
     for t in trades:
         if t["id"] == trade_id:
             t["result"] = pnl
-            found = True
-            break
-    if found:
-        save_trades(trades)
-        emoji = "✅" if pnl > 0 else "❌"
-        await update.message.reply_text(f"{emoji} Результат записан: {'+'if pnl>0 else ''}{pnl}$")
-    else:
-        await update.message.reply_text("Сделка не найдена. Проверь ID.")
+            save_trades(trades)
+            emoji = "✅" if pnl > 0 else "❌"
+            await update.message.reply_text(f"{emoji} Результат: {'+'if pnl>0 else ''}{pnl}$")
+            return
+    await update.message.reply_text("Сделка не найдена.")
 
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     trades = load_trades()
     if not trades:
-        await update.message.reply_text("📊 Сделок пока нет. Добавь первую через 📝 Новая сделка")
+        await update.message.reply_text("Сделок пока нет.")
         return
     closed = [t for t in trades if t["result"] is not None]
     total = len(trades)
@@ -238,48 +252,34 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     losses = len([t for t in closed if t["result"] < 0])
     total_pnl = sum(t["result"] for t in closed)
     wr = round(wins / len(closed) * 100) if closed else 0
-    xau = [t for t in trades if t["pair"] == "XAUUSD"]
-    eur = [t for t in trades if t["pair"] == "EURUSD"]
-    ob_trades = [t for t in trades if "OB" in t["setup"]]
-    fvg_trades = [t for t in trades if t["setup"] == "FVG"]
-    confluence = [t for t in trades if t["setup"] == "OB + FVG"]
     text = f"""📊 *Статистика Загит SMC*
 
-━━━━━━━━━━━━━━━━━━━━
-📈 *Общее*
 - Всего сделок: {total}
 - Закрыто: {len(closed)}
 - Побед: {wins} | Убытков: {losses}
 - Winrate: {wr}%
-- Итого P&L: {'+'if total_pnl>0 else ''}{round(total_pnl, 2)}$
+- P&L: {'+'if total_pnl>0 else ''}{round(total_pnl,2)}$
 
-━━━━━━━━━━━━━━━━━━━━
-📌 *По парам*
-- XAUUSD: {len(xau)} сделок
-- EURUSD: {len(eur)} сделок
+По парам:
+- XAUUSD: {len([t for t in trades if t['pair']=='XAUUSD'])}
+- EURUSD: {len([t for t in trades if t['pair']=='EURUSD'])}
 
-━━━━━━━━━━━━━━━━━━━━
-🎯 *По сетапам*
-- OB: {len(ob_trades)} сделок
-- FVG: {len(fvg_trades)} сделок
-- OB + FVG (confluence): {len(confluence)} сделок
-
-━━━━━━━━━━━━━━━━━━━━
-_Открытых сделок: {total - len(closed)}_"""
+По сетапам:
+- OB+FVG: {len([t for t in trades if t['setup']=='OB + FVG'])}
+- OB: {len([t for t in trades if t['setup']=='OB'])}
+- FVG: {len([t for t in trades if t['setup']=='FVG'])}"""
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = """❓ *Команды бота*
+    text = """❓ *Команды*
 
-📝 *Новая сделка* — записать сделку по шагам
-📊 *Статистика* — winrate, P&L, разбивка по парам
-✅ *Чеклист* — проверка перед входом (8 пунктов SMC)
-📰 *Новости* — даты NFP, CPI, ФРС
+📝 Новая сделка — логировать по шагам
+📊 Статистика — winrate и P&L
+✅ Чеклист — 8 пунктов SMC
+📰 Новости — USD новости на сегодня
 
-/result <ID> <сумма> — записать результат сделки
-_Пример: /result 1234567890 +150_
-
-/cancel — отменить текущее действие"""
+/result ID сумма — записать результат
+/cancel — отменить действие"""
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -293,32 +293,21 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text == "❓ Помощь":
         await help_command(update, ctx)
 
+# ─── SCHEDULER ────────────────────────────────────────────────────────────────
+async def morning_news(bot, chat_id):
+    news = fetch_news_today()
+    text = format_news_message(news)
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
 async def remind_london(bot, chat_id):
-    await bot.send_message(
-        chat_id=chat_id,
-        text="🇬🇧 *Лондонская сессия через 30 минут!*\n\n"
-             "⏰ Торговое окно: 10:00–12:00 МСК\n\n"
-             "Не забудь:\n"
-             "• Проверить структуру азиатской сессии\n"
-             "• Отметить OB и FVG зоны\n"
-             "• Проверить новости на сегодня\n\n"
-             "✅ /checklist",
-        parse_mode="Markdown"
-    )
+    await bot.send_message(chat_id=chat_id, parse_mode="Markdown",
+        text="🇬🇧 *Лондонская сессия через 30 минут!*\n\n⏰ 10:00–12:00 МСК\n\n• Проверь структуру азиатской сессии\n• Отметь OB и FVG зоны\n• Проверь новости дня\n\n✅ /checklist")
 
 async def remind_ny(bot, chat_id):
-    await bot.send_message(
-        chat_id=chat_id,
-        text="🇺🇸 *Нью-Йоркская сессия через 30 минут!*\n\n"
-             "⏰ Торговое окно: 15:00–17:00 МСК\n\n"
-             "Не забудь:\n"
-             "• Проверить структуру лондонской сессии\n"
-             "• Обновить OB и FVG зоны\n"
-             "• Проверить новости США\n\n"
-             "✅ /checklist",
-        parse_mode="Markdown"
-    )
+    await bot.send_message(chat_id=chat_id, parse_mode="Markdown",
+        text="🇺🇸 *Нью-Йоркская сессия через 30 минут!*\n\n⏰ 15:00–17:00 МСК\n\n• Проверь структуру лондонской сессии\n• Обнови OB и FVG зоны\n• Проверь новости США\n\n✅ /checklist")
 
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -358,12 +347,15 @@ def main():
 
     if YOUR_CHAT_ID:
         scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
+        # Утренние новости в 09:00
+        scheduler.add_job(morning_news, "cron", hour=9, minute=0,
+                          day_of_week="mon-fri", args=[app.bot, YOUR_CHAT_ID])
+        # Лондон напоминание в 09:30
         scheduler.add_job(remind_london, "cron", hour=9, minute=30,
-                          day_of_week="mon-fri",
-                          args=[app.bot, YOUR_CHAT_ID])
+                          day_of_week="mon-fri", args=[app.bot, YOUR_CHAT_ID])
+        # NY напоминание в 14:30
         scheduler.add_job(remind_ny, "cron", hour=14, minute=30,
-                          day_of_week="mon-fri",
-                          args=[app.bot, YOUR_CHAT_ID])
+                          day_of_week="mon-fri", args=[app.bot, YOUR_CHAT_ID])
         scheduler.start()
 
     print("🤖 Загит SMC Bot запущен!")
